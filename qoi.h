@@ -2,6 +2,7 @@
 #define QOI_FORMAT_CODEC_QOI_H_
 
 #include "utils.h"
+#include <vector>
 
 constexpr uint8_t QOI_OP_INDEX_TAG = 0x00;
 constexpr uint8_t QOI_OP_DIFF_TAG  = 0x40;
@@ -39,103 +40,171 @@ bool QoiDecode(uint32_t &width, uint32_t &height, uint8_t &channels, uint8_t &co
 
 bool QoiEncode(uint32_t width, uint32_t height, uint8_t channels, uint8_t colorspace) {
 
-    // qoi-header part
-
-    // write magic bytes "qoif"
     QoiWriteChar('q');
     QoiWriteChar('o');
     QoiWriteChar('i');
     QoiWriteChar('f');
-    // write image width
     QoiWriteU32(width);
-    // write image height
     QoiWriteU32(height);
-    // write channel number
     QoiWriteU8(channels);
-    // write color space specifier
     QoiWriteU8(colorspace);
-
-    /* qoi-data part */
-    int run = 0;
-    int px_num = width * height;
 
     uint8_t history[64][4];
     memset(history, 0, sizeof(history));
 
-    uint8_t r, g, b, a;
-    a = 255u;
-    uint8_t pre_r, pre_g, pre_b, pre_a;
-    pre_r = 0u;
-    pre_g = 0u;
-    pre_b = 0u;
-    pre_a = 255u;
+    uint8_t pre_r = 0, pre_g = 0, pre_b = 0, pre_a = 255;
+    int px_num = (int)width * (int)height;
+
+    // Buffer pixels to allow for RUN encoding (lookahead)
+    struct Pixel { uint8_t r, g, b, a; };
+    std::vector<Pixel> pixels(px_num);
+    for (int i = 0; i < px_num; ++i) {
+        pixels[i].r = QoiReadU8();
+        pixels[i].g = QoiReadU8();
+        pixels[i].b = QoiReadU8();
+        pixels[i].a = (channels == 4) ? QoiReadU8() : 255;
+    }
 
     for (int i = 0; i < px_num; ++i) {
-        r = QoiReadU8();
-        g = QoiReadU8();
-        b = QoiReadU8();
-        if (channels == 4) a = QoiReadU8();
+        uint8_t r = pixels[i].r;
+        uint8_t g = pixels[i].g;
+        uint8_t b = pixels[i].b;
+        uint8_t a = pixels[i].a;
 
-        // TODO
+        // 1. QOI_OP_RUN
+        if (i > 0 && r == pre_r && g == pre_g && b == pre_b && a == pre_a) {
+            int run = 0;
+            while (i + 1 < px_num && run < 127 && 
+                   pixels[i+1].r == r && pixels[i+1].g == g && 
+                   pixels[i+1].b == b && pixels[i+1].a == a) {
+                run++;
+                i++;
+            }
+            QoiWriteU8(QOI_OP_RUN_TAG);
+            QoiWriteU8(run);
+            
+            // Update history for the last pixel in the run
+            uint8_t hash = QoiColorHash(r, g, b, a);
+            history[hash][0] = r;
+            history[hash][1] = g;
+            history[hash][2] = b;
+            history[hash][3] = a;
+            pre_r = r; pre_g = g; pre_b = b; pre_a = a;
+            continue;
+        }
 
-        pre_r = r;
-        pre_g = g;
-        pre_b = b;
-        pre_a = a;
+        // 2. QOI_OP_INDEX
+        int index = -1;
+        for (int h = 0; h < 64; ++h) {
+            if (history[h][0] == r && history[h][1] == g && history[h][2] == b && history[h][3] == a) {
+                index = h;
+                break;
+            }
+        }
+
+        // 3. QOI_OP_DIFF
+        bool can_diff = (abs(r - pre_r) <= 64 && abs(g - pre_g) <= 64 && abs(b - pre_b) <= 64 && abs(a - pre_a) <= 64);
+        
+        // 4. QOI_OP_LUMA
+        uint8_t luma = (uint8_t)((r * 77 + g * 150 + b * 29) >> 8);
+        bool can_luma = (r == luma && g == luma && b == luma);
+
+        if (index != -1) {
+            QoiWriteU8(QOI_OP_INDEX_TAG);
+            QoiWriteU8(index);
+        } else if (can_diff) {
+            QoiWriteU8(QOI_OP_DIFF_TAG);
+            QoiWriteU8(r - pre_r);
+            QoiWriteU8(g - pre_g);
+            QoiWriteU8(b - pre_b);
+            QoiWriteU8(a - pre_a);
+        } else if (can_luma) {
+            QoiWriteU8(QOI_OP_LUMA_TAG);
+            QoiWriteU8(luma);
+            QoiWriteU8(a - pre_a);
+        } else {
+            if (channels == 3) {
+                QoiWriteU8(QOI_OP_RGB_TAG);
+                QoiWriteU8(r); QoiWriteU8(g); QoiWriteU8(b);
+            } else {
+                QoiWriteU8(QOI_OP_RGBA_TAG);
+                QoiWriteU8(r); QoiWriteU8(g); QoiWriteU8(b); QoiWriteU8(a);
+            }
+        }
+
+        uint8_t hash = QoiColorHash(r, g, b, a);
+        history[hash][0] = r;
+        history[hash][1] = g;
+        history[hash][2] = b;
+        history[hash][3] = a;
+
+        pre_r = r; pre_g = g; pre_b = b; pre_a = a;
     }
 
-    // qoi-padding part
-    for (int i = 0; i < sizeof(QOI_PADDING) / sizeof(QOI_PADDING[0]); ++i) {
-        QoiWriteU8(QOI_PADDING[i]);
-    }
-
+    for (int i = 0; i < 8; ++i) QoiWriteU8(QOI_PADDING[i]);
     return true;
 }
 
 bool QoiDecode(uint32_t &width, uint32_t &height, uint8_t &channels, uint8_t &colorspace) {
+    // Read and validate magic bytes 'qoif'
+    if (QoiReadU8() != 'q') return false;
+    if (QoiReadU8() != 'o') return false;
+    if (QoiReadU8() != 'i') return false;
+    if (QoiReadU8() != 'f') return false;
 
-    char c1 = QoiReadChar();
-    char c2 = QoiReadChar();
-    char c3 = QoiReadChar();
-    char c4 = QoiReadChar();
-    if (c1 != 'q' || c2 != 'o' || c3 != 'i' || c4 != 'f') {
-        return false;
-    }
-
-    // read image width
     width = QoiReadU32();
-    // read image height
     height = QoiReadU32();
-    // read channel number
     channels = QoiReadU8();
-    // read color space specifier
     colorspace = QoiReadU8();
-
-    int run = 0;
-    int px_num = width * height;
 
     uint8_t history[64][4];
     memset(history, 0, sizeof(history));
+    uint8_t r = 0, g = 0, b = 0, a = 255;
 
-    uint8_t r, g, b, a;
-    a = 255u;
+    long long px_num = (long long)width * height;
+    for (long long i = 0; i < px_num; ++i) {
+        uint8_t tag = QoiReadU8();
+        if (tag == QOI_OP_RUN_TAG) {
+            uint8_t run_val = QoiReadU8();
+            int count = (run_val & 0x7f) + 1;
+            for (int j = 0; j < count; ++j) {
+                QoiWriteU8(r); QoiWriteU8(g); QoiWriteU8(b);
+                if (channels == 4) QoiWriteU8(a);
+            }
+            i += (count - 1);
+        } else if (tag == QOI_OP_INDEX_TAG) {
+            uint8_t index = QoiReadU8();
+            r = history[index][0]; g = history[index][1]; b = history[index][2]; a = history[index][3];
+        } else if (tag == QOI_OP_DIFF_TAG) {
+            r += QoiReadU8(); g += QoiReadU8(); b += QoiReadU8(); a += QoiReadU8();
+        } else if (tag == QOI_OP_LUMA_TAG) {
+            uint8_t lum = QoiReadU8();
+            r = g = b = lum;
+            a += QoiReadU8();
+        } else if (tag == QOI_OP_RGB_TAG) {
+            r = QoiReadU8(); g = QoiReadU8(); b = QoiReadU8(); a = 255;
+        } else if (tag == QOI_OP_RGBA_TAG) {
+            r = QoiReadU8(); g = QoiReadU8(); b = QoiReadU8(); a = QoiReadU8();
+        } else {
+            return false;
+        }
 
-    for (int i = 0; i < px_num; ++i) {
+        if (tag != QOI_OP_RUN_TAG) {
+            QoiWriteU8(r); QoiWriteU8(g); QoiWriteU8(b);
+            if (channels == 4) QoiWriteU8(a);
+        }
 
-        // TODO
-
-        QoiWriteU8(r);
-        QoiWriteU8(g);
-        QoiWriteU8(b);
-        if (channels == 4) QoiWriteU8(a);
+        uint8_t hash = QoiColorHash(r, g, b, a);
+        history[hash][0] = r;
+        history[hash][1] = g;
+        history[hash][2] = b;
+        history[hash][3] = a;
     }
 
-    bool valid = true;
-    for (int i = 0; i < sizeof(QOI_PADDING) / sizeof(QOI_PADDING[0]); ++i) {
-        if (QoiReadU8() != QOI_PADDING[i]) valid = false;
+    for (int i = 0; i < 8; ++i) {
+        if (QoiReadU8() != QOI_PADDING[i]) return false;
     }
-
-    return valid;
+    return true;
 }
 
 #endif // QOI_FORMAT_CODEC_QOI_H_
