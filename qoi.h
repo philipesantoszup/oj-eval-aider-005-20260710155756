@@ -57,43 +57,73 @@ bool QoiEncode(uint32_t width, uint32_t height, uint8_t channels, uint8_t colors
     uint64_t px_num = (uint64_t)width * height;
 
     struct Pixel { uint8_t r, g, b, a; };
-    std::vector<Pixel> pixels;
-    pixels.reserve(px_num);
+    
+    // To avoid MLE on huge images, we use a small buffer for RUN look-ahead.
+    // QOI RUN is max 127, so we only need to look ahead 127 pixels.
+    std::vector<Pixel> window;
+    uint64_t pixels_read = 0;
+
+    auto get_pixel = [&]() -> Pixel {
+        if (pixels_read < px_num) {
+            uint8_t r = QoiReadU8();
+            uint8_t g = QoiReadU8();
+            uint8_t b = QoiReadU8();
+            uint8_t a = (channels == 4) ? QoiReadU8() : 255;
+            pixels_read++;
+            return {r, g, b, a};
+        }
+        return {0, 0, 0, 0};
+    };
 
     for (uint64_t i = 0; i < px_num; ++i) {
-        uint8_t r = QoiReadU8();
-        uint8_t g = QoiReadU8();
-        uint8_t b = QoiReadU8();
-        uint8_t a = (channels == 4) ? QoiReadU8() : 255;
-        pixels.push_back({r, g, b, a});
-    }
+        // Ensure we have at least one pixel to process
+        if (window.empty()) {
+            window.push_back(get_pixel());
+        }
 
-    for (uint64_t i = 0; i < px_num; ++i) {
-        uint8_t r = pixels[i].r;
-        uint8_t g = pixels[i].g;
-        uint8_t b = pixels[i].b;
-        uint8_t a = pixels[i].a;
+        Pixel curr = window[0];
+        uint8_t r = curr.r;
+        uint8_t g = curr.g;
+        uint8_t b = curr.b;
+        uint8_t a = curr.a;
 
+        // 1. Check for RUN
         if (i > 0 && r == pre_r && g == pre_g && b == pre_b && a == pre_a) {
             int run = 0;
-            while (i + 1 < px_num && run < 127 && 
-                   pixels[i+1].r == r && pixels[i+1].g == g && 
-                   pixels[i+1].b == b && pixels[i+1].a == a) {
-                run++;
-                i++;
+            // Fill window to check for run length (up to 127)
+            while (run < 127 && (i + 1 + run) < px_num) {
+                if (window.size() <= (size_t)run + 1) {
+                    window.push_back(get_pixel());
+                }
+                Pixel next = window[run + 1];
+                if (next.r == r && next.g == g && next.b == b && next.a == a) {
+                    run++;
+                } else {
+                    break;
+                }
             }
+            
             QoiWriteU8(QOI_OP_RUN_TAG);
             QoiWriteU8(run);
             
+            // Update history and pre for the run
             uint8_t hash = QoiColorHash(r, g, b, a);
             history[hash][0] = r;
             history[hash][1] = g;
             history[hash][2] = b;
             history[hash][3] = a;
             pre_r = r; pre_g = g; pre_b = b; pre_a = a;
+
+            // Consume the pixels used by the run from the window
+            for (int j = 0; j <= run; ++j) {
+                if (!window.empty()) window.erase(window.begin());
+                i++;
+            }
+            i--; // Adjust for loop increment
             continue;
         }
 
+        // 2. Check for INDEX
         int index = -1;
         for (int h = 0; h < 64; ++h) {
             if (history[h][0] == r && history[h][1] == g && history[h][2] == b && history[h][3] == a) {
@@ -102,11 +132,17 @@ bool QoiEncode(uint32_t width, uint32_t height, uint8_t channels, uint8_t colors
             }
         }
 
-        bool can_diff = (std::abs((int)r - (int)pre_r) <= 64 && 
-                        std::abs((int)g - (int)pre_g) <= 64 && 
-                        std::abs((int)b - (int)pre_b) <= 64 && 
-                        std::abs((int)a - (int)pre_a) <= 64);
+        // 3. Check for DIFF
+        int dr = (int)r - (int)pre_r;
+        int dg = (int)g - (int)pre_g;
+        int db = (int)b - (int)pre_b;
+        int da = (int)a - (int)pre_a;
+        bool can_diff = (dr >= -64 && dr <= 63 && 
+                        dg >= -64 && dg <= 63 && 
+                        db >= -64 && db <= 63 && 
+                        da >= -64 && da <= 63);
         
+        // 4. Check for LUMA
         uint8_t luma = (uint8_t)((r * 77 + g * 150 + b * 29) >> 8);
         bool can_luma = (r == luma && g == luma && b == luma);
 
@@ -115,14 +151,14 @@ bool QoiEncode(uint32_t width, uint32_t height, uint8_t channels, uint8_t colors
             QoiWriteU8(index);
         } else if (can_diff) {
             QoiWriteU8(QOI_OP_DIFF_TAG);
-            QoiWriteU8(r - pre_r);
-            QoiWriteU8(g - pre_g);
-            QoiWriteU8(b - pre_b);
-            QoiWriteU8(a - pre_a);
+            QoiWriteU8((uint8_t)dr);
+            QoiWriteU8((uint8_t)dg);
+            QoiWriteU8((uint8_t)db);
+            QoiWriteU8((uint8_t)da);
         } else if (can_luma) {
             QoiWriteU8(QOI_OP_LUMA_TAG);
             QoiWriteU8(luma);
-            QoiWriteU8(a - pre_a);
+            QoiWriteU8((uint8_t)da);
         } else {
             if (channels == 3) {
                 QoiWriteU8(QOI_OP_RGB_TAG);
@@ -140,6 +176,9 @@ bool QoiEncode(uint32_t width, uint32_t height, uint8_t channels, uint8_t colors
         history[hash][3] = a;
 
         pre_r = r; pre_g = g; pre_b = b; pre_a = a;
+        
+        // Consume the current pixel
+        if (!window.empty()) window.erase(window.begin());
     }
 
     for (int i = 0; i < 8; ++i) QoiWriteU8(QOI_PADDING[i]);
@@ -147,10 +186,10 @@ bool QoiEncode(uint32_t width, uint32_t height, uint8_t channels, uint8_t colors
 }
 
 bool QoiDecode(uint32_t &width, uint32_t &height, uint8_t &channels, uint8_t &colorspace) {
-    if (QoiReadU8() != 'q') return false;
-    if (QoiReadU8() != 'o') return false;
-    if (QoiReadU8() != 'i') return false;
-    if (QoiReadU8() != 'f') return false;
+    if (QoiReadU8() != (uint8_t)'q') return false;
+    if (QoiReadU8() != (uint8_t)'o') return false;
+    if (QoiReadU8() != (uint8_t)'i') return false;
+    if (QoiReadU8() != (uint8_t)'f') return false;
 
     width = QoiReadU32();
     height = QoiReadU32();
