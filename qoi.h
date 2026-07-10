@@ -3,6 +3,7 @@
 
 #include "utils.h"
 #include <vector>
+#include <cmath>
 
 constexpr uint8_t QOI_OP_INDEX_TAG = 0x00;
 constexpr uint8_t QOI_OP_DIFF_TAG  = 0x40;
@@ -53,25 +54,26 @@ bool QoiEncode(uint32_t width, uint32_t height, uint8_t channels, uint8_t colors
     memset(history, 0, sizeof(history));
 
     uint8_t pre_r = 0, pre_g = 0, pre_b = 0, pre_a = 255;
-    int px_num = (int)width * (int)height;
+    uint64_t px_num = (uint64_t)width * height;
 
-    // Buffer pixels to allow for RUN encoding (lookahead)
     struct Pixel { uint8_t r, g, b, a; };
-    std::vector<Pixel> pixels(px_num);
-    for (int i = 0; i < px_num; ++i) {
-        pixels[i].r = QoiReadU8();
-        pixels[i].g = QoiReadU8();
-        pixels[i].b = QoiReadU8();
-        pixels[i].a = (channels == 4) ? QoiReadU8() : 255;
+    std::vector<Pixel> pixels;
+    pixels.reserve(px_num);
+
+    for (uint64_t i = 0; i < px_num; ++i) {
+        uint8_t r = QoiReadU8();
+        uint8_t g = QoiReadU8();
+        uint8_t b = QoiReadU8();
+        uint8_t a = (channels == 4) ? QoiReadU8() : 255;
+        pixels.push_back({r, g, b, a});
     }
 
-    for (int i = 0; i < px_num; ++i) {
+    for (uint64_t i = 0; i < px_num; ++i) {
         uint8_t r = pixels[i].r;
         uint8_t g = pixels[i].g;
         uint8_t b = pixels[i].b;
         uint8_t a = pixels[i].a;
 
-        // 1. QOI_OP_RUN
         if (i > 0 && r == pre_r && g == pre_g && b == pre_b && a == pre_a) {
             int run = 0;
             while (i + 1 < px_num && run < 127 && 
@@ -83,7 +85,6 @@ bool QoiEncode(uint32_t width, uint32_t height, uint8_t channels, uint8_t colors
             QoiWriteU8(QOI_OP_RUN_TAG);
             QoiWriteU8(run);
             
-            // Update history for the last pixel in the run
             uint8_t hash = QoiColorHash(r, g, b, a);
             history[hash][0] = r;
             history[hash][1] = g;
@@ -93,7 +94,6 @@ bool QoiEncode(uint32_t width, uint32_t height, uint8_t channels, uint8_t colors
             continue;
         }
 
-        // 2. QOI_OP_INDEX
         int index = -1;
         for (int h = 0; h < 64; ++h) {
             if (history[h][0] == r && history[h][1] == g && history[h][2] == b && history[h][3] == a) {
@@ -102,10 +102,11 @@ bool QoiEncode(uint32_t width, uint32_t height, uint8_t channels, uint8_t colors
             }
         }
 
-        // 3. QOI_OP_DIFF
-        bool can_diff = (abs(r - pre_r) <= 64 && abs(g - pre_g) <= 64 && abs(b - pre_b) <= 64 && abs(a - pre_a) <= 64);
+        bool can_diff = (std::abs((int)r - (int)pre_r) <= 64 && 
+                        std::abs((int)g - (int)pre_g) <= 64 && 
+                        std::abs((int)b - (int)pre_b) <= 64 && 
+                        std::abs((int)a - (int)pre_a) <= 64);
         
-        // 4. QOI_OP_LUMA
         uint8_t luma = (uint8_t)((r * 77 + g * 150 + b * 29) >> 8);
         bool can_luma = (r == luma && g == luma && b == luma);
 
@@ -146,7 +147,6 @@ bool QoiEncode(uint32_t width, uint32_t height, uint8_t channels, uint8_t colors
 }
 
 bool QoiDecode(uint32_t &width, uint32_t &height, uint8_t &channels, uint8_t &colorspace) {
-    // Read and validate magic bytes 'qoif'
     if (QoiReadU8() != 'q') return false;
     if (QoiReadU8() != 'o') return false;
     if (QoiReadU8() != 'i') return false;
@@ -161,8 +161,8 @@ bool QoiDecode(uint32_t &width, uint32_t &height, uint8_t &channels, uint8_t &co
     memset(history, 0, sizeof(history));
     uint8_t r = 0, g = 0, b = 0, a = 255;
 
-    long long px_num = (long long)width * height;
-    for (long long i = 0; i < px_num; ++i) {
+    uint64_t px_num = (uint64_t)width * height;
+    for (uint64_t i = 0; i < px_num; ++i) {
         uint8_t tag = QoiReadU8();
         if (tag == QOI_OP_RUN_TAG) {
             uint8_t run_val = QoiReadU8();
@@ -170,35 +170,48 @@ bool QoiDecode(uint32_t &width, uint32_t &height, uint8_t &channels, uint8_t &co
             for (int j = 0; j < count; ++j) {
                 QoiWriteU8(r); QoiWriteU8(g); QoiWriteU8(b);
                 if (channels == 4) QoiWriteU8(a);
+                
+                uint8_t hash = QoiColorHash(r, g, b, a);
+                history[hash][0] = r;
+                history[hash][1] = g;
+                history[hash][2] = b;
+                history[hash][3] = a;
             }
             i += (count - 1);
         } else if (tag == QOI_OP_INDEX_TAG) {
             uint8_t index = QoiReadU8();
             r = history[index][0]; g = history[index][1]; b = history[index][2]; a = history[index][3];
+            QoiWriteU8(r); QoiWriteU8(g); QoiWriteU8(b);
+            if (channels == 4) QoiWriteU8(a);
         } else if (tag == QOI_OP_DIFF_TAG) {
             r += QoiReadU8(); g += QoiReadU8(); b += QoiReadU8(); a += QoiReadU8();
+            QoiWriteU8(r); QoiWriteU8(g); QoiWriteU8(b);
+            if (channels == 4) QoiWriteU8(a);
         } else if (tag == QOI_OP_LUMA_TAG) {
             uint8_t lum = QoiReadU8();
             r = g = b = lum;
             a += QoiReadU8();
+            QoiWriteU8(r); QoiWriteU8(g); QoiWriteU8(b);
+            if (channels == 4) QoiWriteU8(a);
         } else if (tag == QOI_OP_RGB_TAG) {
             r = QoiReadU8(); g = QoiReadU8(); b = QoiReadU8(); a = 255;
+            QoiWriteU8(r); QoiWriteU8(g); QoiWriteU8(b);
+            if (channels == 4) QoiWriteU8(a);
         } else if (tag == QOI_OP_RGBA_TAG) {
             r = QoiReadU8(); g = QoiReadU8(); b = QoiReadU8(); a = QoiReadU8();
+            QoiWriteU8(r); QoiWriteU8(g); QoiWriteU8(b);
+            if (channels == 4) QoiWriteU8(a);
         } else {
             return false;
         }
 
         if (tag != QOI_OP_RUN_TAG) {
-            QoiWriteU8(r); QoiWriteU8(g); QoiWriteU8(b);
-            if (channels == 4) QoiWriteU8(a);
+            uint8_t hash = QoiColorHash(r, g, b, a);
+            history[hash][0] = r;
+            history[hash][1] = g;
+            history[hash][2] = b;
+            history[hash][3] = a;
         }
-
-        uint8_t hash = QoiColorHash(r, g, b, a);
-        history[hash][0] = r;
-        history[hash][1] = g;
-        history[hash][2] = b;
-        history[hash][3] = a;
     }
 
     for (int i = 0; i < 8; ++i) {
